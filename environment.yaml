@@ -1,0 +1,9 @@
+name: env-fw2cl
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.9
+  - anaconda
+  - pip
+  - pip:
+      - -r requirements.txt
