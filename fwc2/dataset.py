@@ -33,7 +33,7 @@ class FWC2Dataset(Dataset):
         return len(self.data)
 
 
-def _load(dataset_name = 'dapt20', only_normal = False):
+def load(dataset_name = 'dapt20'):
     base_dir = os.path.join(DATA_BASE_DIR, dataset_name)
     
     assert os.path.exists(base_dir), f'{dataset_name} folder must exist'
@@ -47,6 +47,7 @@ def _load(dataset_name = 'dapt20', only_normal = False):
         file_path = os.path.join(base_dir, csv_file)
         try:
             df = pd.read_csv(file_path)
+            print(f'{csv_file} shape of data = {df.shape}')
             dfs.append(df)
         except Exception as e:
             print(f"Error loading {csv_file}: {str(e)}")
@@ -54,6 +55,10 @@ def _load(dataset_name = 'dapt20', only_normal = False):
     
     df = pd.concat(dfs, ignore_index=True)    
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+
+    # fix issue with cicids17
+    if 'fwd_header_length.1' in df.columns:
+        df = df.drop(['fwd_header_length.1'], axis='columns')
     
     if dataset_name == 'dapt20':
         df['label'] = df['stage']
@@ -61,18 +66,11 @@ def _load(dataset_name = 'dapt20', only_normal = False):
         
     df.label = df.label.str.lower().replace('normal', 'benign')
     
-    
     return df
 
 def load_pretraining(subsets = ['cicidsd17'], train_ratio = 0.7):
-    dfs = [_load(subset, only_normal=True) for subset in subsets]
+    dfs = [load(subset) for subset in subsets]
     df = dfs[0] if len(dfs) == 1 else pd.concat(dfs, ignore_index=True)
-    
-    # fix issue with cicids17
-    df = df.drop(['fwd_header_length.1'], axis='columns')
-    
-    df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
-    df.label = df.label.str.lower().replace('normal', 'benign')
     
     cols_to_drop = ['source.name', 'flow_id', 'id', 'src_ip', 'dst_ip', 'source_ip', 'destination_ip', 'timestamp', 'src_port', 'dst_port', 'source_port', 'destination_port', 'protocol']
     drop_cols = [col for col in cols_to_drop if col in df.columns]
@@ -95,9 +93,9 @@ def load_pretraining(subsets = ['cicidsd17'], train_ratio = 0.7):
     train_mask = np.random.rand(len(benign_data)) < train_ratio
     
     # train & test data
-    train, test = benign_data[train_mask], pd.concat([benign_data[~train_mask], attk_data])
+    train, test = benign_data[train_mask], pd.concat([benign_data[~train_mask], attk_data], ignore_index=True)
     train_x, train_y = train.drop(['label'], axis=1), train['label']
-    test_x, test_y = test.drop(['label'], axis=1), train['label']
+    test_x, test_y = test.drop(['label'], axis=1), test['label']
     
     return train_x, train_y, test_x, test_y
 

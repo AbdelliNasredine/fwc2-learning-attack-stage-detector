@@ -4,10 +4,11 @@ from torch import Tensor
 from torch.distributions.uniform import Uniform
 
 class MLP(torch.nn.Sequential):
-    def __init__(self, input_dim: int, hidden_dim: int, num_hidden: int, dropout: float = 0.0) -> None:
+    def __init__(self, input_dim: int, hidden_dims: list, dropout: float = 0.0) -> None:
         layers = []
         in_dim = input_dim
-        for _ in range(num_hidden - 1):
+        for i in range(len(hidden_dims)):
+            hidden_dim = hidden_dims[i]
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.BatchNorm1d(hidden_dim))
             layers.append(nn.ReLU(inplace=True))
@@ -18,16 +19,29 @@ class MLP(torch.nn.Sequential):
 
         super().__init__(*layers)
 
+# class MLP(torch.nn.Sequential):
+#     def __init__(self, input_dim: int, hidden_dim: int, num_hidden: int, dropout: float = 0.0) -> None:
+#         layers = []
+#         in_dim = input_dim
+#         for _ in range(num_hidden - 1):
+#             layers.append(nn.Linear(in_dim, hidden_dim))
+#             layers.append(nn.BatchNorm1d(hidden_dim))
+#             layers.append(nn.ReLU(inplace=True))
+#             layers.append(nn.Dropout(dropout))
+#             in_dim = hidden_dim
+
+#         layers.append(nn.Linear(in_dim, hidden_dim))
+
+#         super().__init__(*layers)
+
 class FWC2(nn.Module):
     def __init__(
         self,
         input_dim: int,
         features_low: int,
         features_high: int,
-        dim_hidden_encoder: int,
-        num_hidden_encoder: int,
-        dim_hidden_head: int,
-        num_hidden_head: int,
+        dims_hidden_encoder: list,
+        dims_hidden_head: list,
         corruption_rate: float = 0.6,
         dropout: float = 0.0,
     ) -> None:
@@ -35,8 +49,8 @@ class FWC2(nn.Module):
 
         # todo: impl other encoder_arch
         
-        self.encoder = MLP(input_dim, dim_hidden_encoder, num_hidden_encoder, dropout)
-        self.pretraining_head = MLP(dim_hidden_encoder, dim_hidden_head, num_hidden_head, dropout)
+        self.encoder = MLP(input_dim, dims_hidden_encoder, dropout)
+        self.pretraining_head = MLP(dims_hidden_encoder[-1], dims_hidden_head, dropout)
 
         # uniform disstribution over marginal distributions of dataset's features
         self.marginals = Uniform(torch.Tensor(features_low), torch.Tensor(features_high))
