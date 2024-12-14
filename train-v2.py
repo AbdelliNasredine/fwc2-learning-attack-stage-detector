@@ -11,10 +11,12 @@ from sklearn.metrics import f1_score, confusion_matrix
 from sklearn.manifold import TSNE
 
 import torch
+from torch.utils.data import random_split
 from torch.nn import CrossEntropyLoss
 from torch.optim import Adam
 from torch.utils.data import DataLoader
-import pytorch_lightning as pl
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 
 from fwc2.model import MLP, RandomFeatureCorruption, FWC2PreTrainer
 from fwc2.loss import NTXent
@@ -22,35 +24,6 @@ from fwc2.data import FWC2Dataset
 from fwc2.utils import preprocess
 
 SEED = 42
-
-
-class EarlyStopping:
-    def __init__(self, patience=5, delta=0.0):
-        self.patience = patience
-        self.delta = delta
-        self.best_score = None
-        self.early_stop = False
-        self.counter = 0
-        self.best_model_state = None
-
-    def __call__(self, val_loss, model):
-        score = -val_loss
-
-        if self.best_score is None:
-            self.best_score = score
-            self.best_model_state = model.state_dict()
-        elif score < self.best_score + self.delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.best_model_state = model.state_dict()
-            self.counter = 0
-
-    def load_best_model(self, model):
-        model.load_state_dict(self.best_model_state)
-
 
 def fwc2_pretrain(
         train_ds,
@@ -253,10 +226,9 @@ def evaluate_model(model, test_ds, device: torch.device):
 
     return test_acc, f1, conf_matrix
 
-def prepare_data(dataset_name='scvic-apt-2021'):
+def load_data(dataset_name='scvic-apt-2021'):
     df = pd.read_csv(f'./datasets/{dataset_name}/all.csv')
     df = preprocess(df)
-
     X, y = df.drop('label', axis=1), df['label']
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -266,41 +238,26 @@ def prepare_data(dataset_name='scvic-apt-2021'):
         stratify=y,
         random_state=SEED
     )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train,
-        y_train,
-        test_size=0.125,
-        random_state=SEED,
-        stratify=y_train,
-    )
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.fit_transform(X_val)
     X_test_scaled = scaler.fit_transform(X_test)
 
     label_encoder = LabelEncoder()
     y_train = label_encoder.fit_transform(y_train)
-    y_val = label_encoder.fit_transform(y_val)
     y_test = label_encoder.fit_transform(y_test)
 
     train_ds = FWC2Dataset(X_train_scaled, y_train, columns=X.columns)
-    val_ds = FWC2Dataset(X_val_scaled, y_val, columns=X.columns)
     test_ds = FWC2Dataset(X_test_scaled, y_test, columns=X.columns)
 
-    return train_ds, val_ds, test_ds
+    return train_ds, test_ds
 
 def main():
-    # data = load('dapt20', base_dir='datasets')
-    # data = preprocess(data, pretraining=True)
-    # X, y = data.drop('label', axis=1), data['label']
-    # pretrain_x, rest_x, pretrain_y, rest_y = train_test_split(X, y, test_size=0.5, random_state=SEED, shuffle=True, stratify=y)
-    # train_ds, val_ds, test_ds = prepare_pretrainig_data(pretrain_x, pretrain_y)
-
-    device = torch.device("gpu" if torch.cuda.is_available() else "cpu")
+    # datasets = {'dapt20': 5, 'scvic-apt-2021': 6, 'mscad': 6}
+    datasets = {'dapt20': 5}
     encoder_dims = [256, 256, 256, 256]
     projection_dims = [128, 128]
-    corruption_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    corruption_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     dropout_rate = 0.1
     tau = 1.0
     batch_size = 256
@@ -309,32 +266,28 @@ def main():
     max_finetune_epochs = 100
     pretrain_early_stopping_patience = 5
 
-    # datasets = {'dapt20': 5, 'scvic-apt-2021': 6, 'mscad': 6}
-    datasets = {'dapt20': 5}
+
     for dataset, num_stages in datasets.items():
-        print(f'Starting with {dataset}')
-        os.makedirs(f'./output/{dataset}', exist_ok=True)
+        train_set, test_set = load_data(dataset)
+        train_set_size = int(len(train_set) * 0.8)
+        valid_set_size = len(train_set) - train_set_size
+        seed = torch.Generator().manual_seed(SEED)
+        train_set, valid_set = random_split(train_set, [train_set_size, valid_set_size], generator=seed)
 
-        train_ds, val_ds, test_ds = prepare_data(dataset)
-
-        scores = {
-            'test_acc': [],
-            'f1': []
-        }
-
+        # pretrain
         for cp in corruption_rates:
-            print(f'Staring with c_rate = {cp}...')
+            print(f'******************************************')
+            print(f'**** PRETRAINING - CORRUPT_RATE = {cp} ***')
+            print(f'******************************************')
 
-            # todo: setup data loaders & model components module
-
-            input_dim = train_ds.shape[1]
+            input_dim = train_set.dataset.shape[1]
             encoder = MLP(input_dim=input_dim, hidden_dims=encoder_dims, dropout=dropout_rate,)
             projector = MLP(input_dim=encoder_dims[-1], hidden_dims=projection_dims, dropout=dropout_rate)
             loss_fn = NTXent(temperature=tau)
             corrupt_fn = RandomFeatureCorruption(
                 corruption_rate=cp,
-                features_min=train_ds.features_low,
-                features_max=train_ds.features_high
+                features_min=train_set.dataset.features_low,
+                features_max=train_set.dataset.features_high
             )
 
             model = FWC2PreTrainer(
@@ -345,12 +298,13 @@ def main():
                 config={'lr': learning_rate}
             )
 
-            train_loader = DataLoader(train_ds, batch_size=batch_size, num_workers=15)
-            val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=15, persistent_workers=True)
+            train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=15, persistent_workers=True)
+            val_loader = DataLoader(valid_set, batch_size=batch_size, num_workers=15, persistent_workers=True)
 
+            callbacks = [EarlyStopping(monitor="val_loss", patience=pretrain_early_stopping_patience, verbose=True, mode="min")]
             trainer = pl.Trainer(
-                max_epochs=1,
-                limit_train_batches=100,
+                max_epochs=max_pretrain_epochs,
+                callbacks=callbacks
             )
             trainer.fit(
                 model,
@@ -358,48 +312,6 @@ def main():
                 val_loader
             )
 
-
-            # m, pretrain_history = fwc2_pretrain(
-            #     train_ds=train_ds,
-            #     val_ds=val_ds,
-            #     encoder_dims=encoder_dims,
-            #     projection_dims=projection_dims,
-            #     corruption_rate=cp,
-            #     tau=tau,
-            #     batch_size=batch_size,
-            #     max_epochs=max_pretrain_epochs,
-            #     device=device
-            # )
-
-            # torch.save(m.state_dict(), f'./output/{dataset}/pretrained-model--w(cp={cp},tau={tau},ds={dataset}).pt')
-            #
-            # history_df = pd.DataFrame(pretrain_history)
-            # history_df.to_csv(f'./output/{dataset}/pretraining-history--w(cp={cp},tau={tau},ds={dataset}).csv', encoding='utf-8')
-            #
-            # for param in m.encoder.parameters():
-            #     param.requires_grad = False
-            # m.head = MLP(encoder_dims[-1], [128, 64, num_stages])
-            #
-            # m, finetune_history = finetune(
-            #     m,
-            #     train_ds=train_ds,
-            #     val_ds=val_ds,
-            #     max_epochs=max_finetune_epochs,
-            #     batch_size=batch_size,
-            #     device=device
-            # )
-            #
-            # torch.save(m.state_dict(), f'./output/{dataset}/fine-tuned-model--w(cp={cp},tau={tau},ds={dataset}).pt')
-            #
-            # history_df = pd.DataFrame(finetune_history)
-            # history_df.to_csv(f'./output/{dataset}/fine-tuned-history--w(cp={cp},tau={tau},ds={dataset}).csv', encoding='utf-8')
-            #
-            # print('Evaluations on test data ...')
-            # acc, f1, cm = evaluate_model(m, test_ds, device)
-            # (pd.DataFrame(cm)).to_csv(f'./output/{dataset}/eval-cm--w(cp={cp},tau={tau},ds={dataset}).csv',encoding='utf-8')
-            #
-            # scores['test_acc'].append(acc)
-            # scores['f1'].append(f1)
-        # (pd.DataFrame(scores)).to_csv(f'./output/{dataset}/eval-scores--w(tau={tau},ds={dataset}).csv',encoding='utf-8')
+        # todo: add fine tuning
 if __name__ == "__main__":
     main()

@@ -3,7 +3,7 @@ import torch.nn as nn
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
 from torch import Tensor
 from torch.distributions.uniform import Uniform
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 
 
 class RandomFeatureCorruption:
@@ -127,16 +127,12 @@ class FWC2PreTrainer(pl.LightningModule):
         self.loss_fn = loss_fn
         self.config = config
 
-    def forward(self, x: Tensor) -> Tensor:
-        embeddings, embeddings_corrupted = self.model(x)
-        return embeddings, embeddings_corrupted
-
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
         return optimizer
 
     def training_step(self, batch, batch_idx):
-        x, y = batch
+        x, _ = batch
 
         z_i, z_j = self.projector(self.encoder(x)), self.projector(self.encoder(self.corrupt_fn(x)))
         loss = self.loss_fn(z_i, z_j)
@@ -145,9 +141,53 @@ class FWC2PreTrainer(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
+        x, _ = batch
 
         z_i, z_j = self.projector(self.encoder(x)), self.projector(self.encoder(self.corrupt_fn(x)))
         loss = self.loss_fn(z_i, z_j)
 
+        self.log('val_loss', loss)
+
+class FWC2FineTuner(pl.LightningModule):
+    def __init__(
+            self,
+            encoder,
+            predictor,
+            loss_fn,
+            config,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.predictor = predictor
+        self.loss_fn = loss_fn
+        self.config = config
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
+        return optimizer
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+
+        logits = self.predictor(self.encoder(x))
+        loss = self.loss_fn(logits, y)
+
+        y_p = torch.argmax(logits, dim=1)
+        acc = (y_p == y).float().mean()
+
+        self.log('train_acc', acc) 
+        self.log('train_loss', loss)
+        
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+
+        logits = self.predictor(self.encoder(x))
+        loss = self.loss_fn(logits, y)
+
+        y_p = torch.argmax(logits, dim=1)
+        acc = (y_p == y).float().mean()
+
+        self.log('val_acc', acc) 
         self.log('val_loss', loss)
