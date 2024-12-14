@@ -1,2 +1,6 @@
 .envs
 datasets/*
+output
+lightning_logs
+lightning_logs/*
+.idea
