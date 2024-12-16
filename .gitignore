@@ -4,3 +4,5 @@ output
 lightning_logs
 lightning_logs/*
 .idea
+wandb
+fwc2-two-stage-learning

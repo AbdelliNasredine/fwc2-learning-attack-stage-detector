@@ -4,6 +4,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+from argparse import ArgumentParser
+
+import wandb
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -17,13 +20,15 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from lightning.pytorch.loggers import WandbLogger
 
-from fwc2.model import MLP, RandomFeatureCorruption, FWC2PreTrainer
+from fwc2.model import MLP, RandomFeatureCorruption, FWC2PreTrainer, FWC2FineTuner, FWC2v3
 from fwc2.loss import NTXent
 from fwc2.data import FWC2Dataset
 from fwc2.utils import preprocess
 
 SEED = 42
+
 
 def fwc2_pretrain(
         train_ds,
@@ -195,6 +200,7 @@ def finetune(model, train_ds, val_ds, max_epochs: int, batch_size: int, device: 
 
     return model, history
 
+
 def evaluate_model(model, test_ds, device: torch.device):
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False)
     model.eval()
@@ -226,6 +232,7 @@ def evaluate_model(model, test_ds, device: torch.device):
 
     return test_acc, f1, conf_matrix
 
+
 def load_data(dataset_name='scvic-apt-2021'):
     df = pd.read_csv(f'./datasets/{dataset_name}/all.csv')
     df = preprocess(df)
@@ -252,66 +259,143 @@ def load_data(dataset_name='scvic-apt-2021'):
 
     return train_ds, test_ds
 
-def main():
-    # datasets = {'dapt20': 5, 'scvic-apt-2021': 6, 'mscad': 6}
-    datasets = {'dapt20': 5}
-    encoder_dims = [256, 256, 256, 256]
-    projection_dims = [128, 128]
-    corruption_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-    dropout_rate = 0.1
-    tau = 1.0
-    batch_size = 256
-    learning_rate = 1e-3
-    max_pretrain_epochs = 1000
-    max_finetune_epochs = 100
-    pretrain_early_stopping_patience = 5
+
+def main(
+        ds_name: str,
+        in_dim: int,
+        num_stages: int,
+        cp: float,
+        tau: float,
+        max_pretrain_epochs: int,
+        max_finetune_epochs: int,
+        learning_rate=1e-3,
+        batch_size=256,
+        dropout_rate=0.1,
+        pretrain_early_stopping_patience: int = 5,
+):
+    print(f'****************************')
+    print(f'*** STARING EXPERIMENT *****')
+    print(f'*** corrupt_rate = {cp} ')
+    print(f'*** dataset = {ds_name} ')
+    print(f'*** in_dim = {in_dim}   ')
+    print(f'*** tau = {tau}         ')
+    print(f'*** #stages = {num_stages}')
+    print(f'*** max_pretrain_epochs = {max_pretrain_epochs}')
+    print(f'*** max_finetune_epochs = {max_finetune_epochs}')
+    print(f'*** learning_rate = {learning_rate}')
+    print(f'*** batch_size = {batch_size}')
+    print(f'*** dropout_rate = {dropout_rate}')
+    print(f'****************************')
+
+    pl.seed_everything(SEED)
+
+    # wandb
+    wandb_logger = WandbLogger(project='fwc2-hybrid-ssl-learning', log_model=True)
+    wandb_logger.experiment.config["dataset"] = ds_name
+    wandb_logger.experiment.config["batch_size"] = batch_size
+    wandb_logger.experiment.config["corruption_rate"] = cp
+    wandb_logger.experiment.config["temprature"] = tau
+
+    train_set, test_set = load_data(ds_name)
+    train_set_size = int(len(train_set) * 0.8)
+    valid_set_size = len(train_set) - train_set_size
+    seed = torch.Generator().manual_seed(SEED)
+    train_set, valid_set = random_split(train_set, [train_set_size, valid_set_size], generator=seed)
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=15,
+                              persistent_workers=True)
+    val_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=15,
+                            persistent_workers=True)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+
+    print(f'******************************************')
+    print(f'**** PRETRAINING - CORRUPT_RATE = {cp} ***')
+    print(f'******************************************')
+
+    encoder_dims = [128, 64, 32, 16]
+    projection_dims = [8, 8]
+    decoder_dims = [16, 32, in_dim]
+
+    model = FWC2v3(
+        in_dim=in_dim,
+        encoder_dims=encoder_dims,
+        decoder_dims=decoder_dims,
+        projector_dims=projection_dims,
+        corrupt_rate=cp,
+        features_low=train_set.dataset.features_low,
+        features_high=train_set.dataset.features_high,
+        tau=tau,
+        lr=learning_rate,
+        dropout=dropout_rate
+    )
+
+    # callbacks = [
+    #     EarlyStopping(monitor="val_loss", patience=pretrain_early_stopping_patience, verbose=True, mode="min")]
+    trainer = pl.Trainer(
+        max_epochs=max_pretrain_epochs,
+        # callbacks=callbacks,
+        logger=wandb_logger,
+        log_every_n_steps=10,
+        deterministic=True,
+        fast_dev_run=True,
+    )
+    trainer.fit(
+        model,
+        train_loader,
+        val_loader
+    )
+
+    wandb_logger.finalize()
+
+    # print(f'******************************************')
+    # print(f'******** FINE-TUNING - SUPERVISED ********')
+    # print(f'******************************************')
+    #
+    # loss_fn = CrossEntropyLoss()
+    # model = FWC2FineTuner(
+    #     encoder=encoder,
+    #     predictor=predictor,
+    #     loss_fn=loss_fn,
+    #     config={'lr': learning_rate}
+    # )
+    # trainer = pl.Trainer(
+    #     logger=wandb_logger,
+    #     max_epochs=max_finetune_epochs,
+    #     log_every_n_steps=10,
+    #     deterministic=True
+    # )
+    # trainer.fit(
+    #     model,
+    #     train_loader,
+    #     val_loader
+    # )
+    # trainer.test(model, test_loader)
 
 
-    for dataset, num_stages in datasets.items():
-        train_set, test_set = load_data(dataset)
-        train_set_size = int(len(train_set) * 0.8)
-        valid_set_size = len(train_set) - train_set_size
-        seed = torch.Generator().manual_seed(SEED)
-        train_set, valid_set = random_split(train_set, [train_set_size, valid_set_size], generator=seed)
-
-        # pretrain
-        for cp in corruption_rates:
-            print(f'******************************************')
-            print(f'**** PRETRAINING - CORRUPT_RATE = {cp} ***')
-            print(f'******************************************')
-
-            input_dim = train_set.dataset.shape[1]
-            encoder = MLP(input_dim=input_dim, hidden_dims=encoder_dims, dropout=dropout_rate,)
-            projector = MLP(input_dim=encoder_dims[-1], hidden_dims=projection_dims, dropout=dropout_rate)
-            loss_fn = NTXent(temperature=tau)
-            corrupt_fn = RandomFeatureCorruption(
-                corruption_rate=cp,
-                features_min=train_set.dataset.features_low,
-                features_max=train_set.dataset.features_high
-            )
-
-            model = FWC2PreTrainer(
-                encoder=encoder,
-                projector=projector,
-                corrupt_fn=corrupt_fn,
-                loss_fn=loss_fn,
-                config={'lr': learning_rate}
-            )
-
-            train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=15, persistent_workers=True)
-            val_loader = DataLoader(valid_set, batch_size=batch_size, num_workers=15, persistent_workers=True)
-
-            callbacks = [EarlyStopping(monitor="val_loss", patience=pretrain_early_stopping_patience, verbose=True, mode="min")]
-            trainer = pl.Trainer(
-                max_epochs=max_pretrain_epochs,
-                callbacks=callbacks
-            )
-            trainer.fit(
-                model,
-                train_loader,
-                val_loader
-            )
-
-        # todo: add fine tuning
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+
+    parser.add_argument("--cr", type=float, default=0.5)
+    parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--ds", type=str, default='dapt20')
+    parser.add_argument("--bs", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--dpr", type=float, default=0.1)
+    parser.add_argument("--pt-max-epochs", type=int, default=30)
+    parser.add_argument("--ft-max-epochs", type=int, default=10)
+
+    args = parser.parse_args()
+
+    dataset = {'dapt20': (5, 64), 'scvic-apt-2021': (6, None), 'mscad': (6, None)}[args.ds]
+    main(
+        args.ds,
+        dataset[1],
+        dataset[0],
+        args.cr,
+        args.tau,
+        learning_rate=args.lr,
+        batch_size=args.bs,
+        dropout_rate=args.dpr,
+        max_pretrain_epochs=args.pt_max_epochs,
+        max_finetune_epochs=args.ft_max_epochs,
+    )
