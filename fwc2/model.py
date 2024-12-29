@@ -4,24 +4,32 @@ import torch.nn as nn
 from torch import Tensor
 from torch.distributions.uniform import Uniform
 import lightning.pytorch as pl
+import torchmetrics
 from torchmetrics.classification import Accuracy
+import pytorch_metric_learning.losses as losses
 
 from fwc2.loss import NTXent, FWC2Loss
+from fwc2.utils import find_net_arch
+
+from typing import Optional
 
 
 class RandomFeatureCorruption:
-    def __init__(self, corruption_rate, features_low, features_high):
+    def __init__(self, corruption_rate: float = 0.6, features_low: numpy.ndarray = None,
+                 features_high: numpy.ndarray = None):
         self.marginals = Uniform(torch.Tensor(features_low), torch.Tensor(features_high))
         self.corruption_rate = corruption_rate
 
     def __call__(self, x):
         bs, _ = x.size()
 
-        corruption_mask = torch.rand_like(x, device=x.device) > self.corruption_rate
+        mask = torch.rand_like(x, device=x.device) >= self.corruption_rate
         x_random = self.marginals.sample(torch.Size((bs,))).to(x.device)
-        x_corrupted = torch.where(corruption_mask, x_random, x)
 
-        return x_corrupted
+        xc1 = torch.where(mask, x_random, x)
+        xc2 = torch.where(~mask, x_random, x)
+
+        return xc1, xc2
 
 
 class MLP(torch.nn.Sequential):
@@ -41,213 +49,104 @@ class MLP(torch.nn.Sequential):
         super().__init__(*layers)
 
 
-class FWC2(nn.Module):
+class MLPv2(torch.nn.Sequential):
+    def __init__(self, input_dim: int, hidden_dims: list, dropout: float = 0.0) -> None:
+        layers = []
+        in_dim = input_dim
+        for i in range(len(hidden_dims)):
+            hidden_dim = hidden_dims[i]
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+
+        layers.append(nn.Linear(in_dim, hidden_dim))
+
+        super().__init__(*layers)
+
+
+class LinearLayer(nn.Module):
+    """
+    Module to create a sequential block consisting of:
+
+        1. Linear layer
+        2. (optional) Batch normalization layer
+        3. ReLu activation layer
+    """
+
+    def __init__(self, input_size: int, output_size: int, batch_norm: bool = False):
+        super().__init__()
+        self.size_in = input_size
+        self.size_out = output_size
+        if batch_norm:
+            self.model = nn.Sequential(
+                nn.Linear(input_size, output_size),
+                nn.BatchNorm1d(output_size),
+                nn.ReLU(),
+            )
+        else:
+            self.model = nn.Sequential(nn.Linear(input_size, output_size), nn.ReLU())
+
+    def forward(self, x: torch.tensor):
+        """Run inputs through linear block."""
+        return self.model(x)
+
+
+class LazyMLP(nn.Module):
+    def __init__(self, n_layers: int, dim_hidden: int, batch_norm: bool = False):
+        super().__init__()
+        self.n_layers = n_layers
+        self.dim_hidden = dim_hidden
+        if batch_norm:
+            lazy_block = nn.Sequential(
+                nn.LazyLinear(dim_hidden),
+                nn.BatchNorm1d(dim_hidden),
+                nn.ReLU(),
+            )
+        else:
+            lazy_block = nn.Sequential(nn.LazyLinear(dim_hidden), nn.ReLU())
+
+        self.model = nn.Sequential(
+            lazy_block,
+            *[LinearLayer(dim_hidden, dim_hidden, batch_norm) for _ in range(n_layers - 1)],
+        )
+
+    def forward(self, x: torch.tensor):
+        """Run inputs through linear block."""
+        return self.model(x)
+
+
+class S2SDEncoder(pl.LightningModule):
     def __init__(
             self,
-            input_dim: int,
-            features_low: int,
-            features_high: int,
-            dims_hidden_encoder: list,
-            dims_hidden_head: list,
-            corruption_rate: float = 0.6,
-            dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.encoder = MLP(input_dim, dims_hidden_encoder, dropout)
-        self.head = MLP(dims_hidden_encoder[-1], dims_hidden_head, dropout)
-
-        self.marginals = Uniform(torch.Tensor(features_low), torch.Tensor(features_high))
-        self.corruption_rate = corruption_rate
-
-    def forward(self, x: Tensor) -> Tensor:
-        batch_size, _ = x.size()
-
-        corruption_mask = torch.rand_like(x, device=x.device) > self.corruption_rate
-        x_random = self.marginals.sample(torch.Size((batch_size,))).to(x.device)
-        x_corrupted = torch.where(corruption_mask, x_random, x)
-
-        embeddings = self.head(self.encoder(x))
-        embeddings_corrupted = self.head(self.encoder(x_corrupted))
-
-        return embeddings, embeddings_corrupted
-
-    @torch.inference_mode()
-    def get_embeddings(self, x: Tensor) -> Tensor:
-        return self.encoder(x)
-
-
-class FWC2V2(nn.Module):
-    def __init__(
-            self,
-            input_dim: int,
-            features_low: int,
-            features_high: int,
-            dims_hidden_encoder: list,
-            dims_hidden_head: list,
-            corruption_rate: float = 0.6,
-            dropout: float = 0.0,
+            hidden_dim: int,
+            n_encoder_layers: int,
+            n_projection_layers: int,
+            loss_fn: nn.Module = losses.SelfSupervisedLoss(losses.NTXentLoss(temperature=1.0)),
+            corrupt_fn=None,
+            lr: float = 1e-3,
+            batch_norm: bool = False,
     ) -> None:
         super().__init__()
 
-        self.encoder = MLP(input_dim, dims_hidden_encoder, dropout)
-        self.head = MLP(dims_hidden_encoder[-1], dims_hidden_head, dropout)
+        self.save_hyperparameters(ignore=['corrupt_fn'])
 
-        self.marginals = Uniform(torch.Tensor(features_low), torch.Tensor(features_high))
-        self.corruption_rate = corruption_rate
-
-    def forward(self, x: Tensor) -> Tensor:
-        batch_size, _ = x.size()
-
-        corruption_mask = torch.rand_like(x, device=x.device) > self.corruption_rate
-        x_random = self.marginals.sample(torch.Size((batch_size,))).to(x.device)
-
-        x_pos = torch.where(corruption_mask, x_random, x)
-        x_anchor = torch.where(~corruption_mask, x_random, x)
-
-        emb_pos = self.head(self.encoder(x_pos))
-        emb_anchor = self.head(self.encoder(x_anchor))
-
-        return emb_pos, emb_anchor
-
-    @torch.inference_mode()
-    def get_embeddings(self, x: Tensor) -> Tensor:
-        return self.encoder(x)
-
-
-class FWC2PreTrainer(pl.LightningModule):
-    def __init__(
-            self,
-            encoder,
-            projector,
-            corrupt_fn,
-            loss_fn,
-            config,
-    ) -> None:
-        super().__init__()
-        self.encoder = encoder
-        self.projector = projector
-        self.corrupt_fn = corrupt_fn
         self.loss_fn = loss_fn
-        self.config = config
+        self.corrupt_fn = corrupt_fn
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
-        return optimizer
+        self.encoder = LazyMLP(n_layers=n_encoder_layers, dim_hidden=hidden_dim, batch_norm=batch_norm)
+        self.projector = LazyMLP(n_layers=n_projection_layers, dim_hidden=hidden_dim, batch_norm=batch_norm)
 
     def _step(self, x: Tensor):
-        h_i, h_j = self.projector(self.encoder(x)), self.projector(self.encoder(self.corrupt_fn(x)))
-        loss = self.loss_fn(h_i, h_j)
+        x1, x2 = self.corrupt_fn(x)
+        h1, h2 = self.projector(self.encoder(x1)), self.projector(self.encoder(x2))
 
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        x, _ = batch
-
-        loss = self._step(x)
-
-        self.log('train_loss', loss)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        x, _ = batch
-
-        loss = self._step(x)
-
-        self.log('val_loss', loss)
-
-
-class FWC2FineTuner(pl.LightningModule):
-    def __init__(
-            self,
-            encoder,
-            predictor,
-            loss_fn,
-            config,
-            num_classes=5,
-    ) -> None:
-        super().__init__()
-        self.encoder = encoder
-        self.predictor = predictor
-        self.loss_fn = loss_fn
-        self.config = config
-        self.train_accuracy = Accuracy(task='multiclass', num_classes=num_classes)
-        self.val_accuracy = Accuracy(task='multiclass', num_classes=num_classes)
-        self.test_accuracy = Accuracy(task='multiclass', num_classes=num_classes)
-
-        # freezing encoder
-        # for param in self.encoder.parameters():
-        #     param.requires_grad = False
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
-        return optimizer
-
-    def forward(self, x: Tensor) -> Tensor:
-        # with torch.no_grad:
-        z = self.encoder(x)
-        return self.predictor(z)
-
-    def _step(self, batch):
-        x, y = batch
-
-        scores = self(x)
-        loss = self.loss_fn(scores, y)
-
-        return scores, loss, y
-
-    def training_step(self, batch, batch_idx):
-        scores, loss, y = self._step(batch)
-
-        self.log_dict({'train_loss': loss, 'train_acc': self.train_accuracy(scores, y)}, prog_bar=True)
-
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        scores, loss, y = self._step(batch)
-
-        self.log_dict({'val_loss': loss, 'val_acc': self.val_accuracy(scores, y)}, prog_bar=True)
-
-    def test_step(self, batch, batch_idx):
-        scores, loss, y = self._step(batch)
-
-        self.log_dict({'test_loss': loss, 'test_acc': self.test_accuracy(scores, y)}, prog_bar=True)
-
-
-class FWC2v3(pl.LightningModule):
-    def __init__(
-            self,
-            in_dim: int,
-            encoder_dims: list,
-            projector_dims: list,
-            decoder_dims: list,
-            corrupt_rate: float = 0.6,
-            features_low: numpy.ndarray = None,
-            features_high: numpy.ndarray = None,
-            tau: float = 1.0,
-            lr: float = 1e-3,
-            dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-
-        self.save_hyperparameters()
-
-        self.encoder = MLP(in_dim, encoder_dims, dropout)
-        self.projector = MLP(encoder_dims[-1], projector_dims, dropout)
-        self.decoder = MLP(encoder_dims[-1], decoder_dims, dropout)
-        self.corrupt_fn = RandomFeatureCorruption(corrupt_rate, features_low, features_high)
-        self.loss_fn = FWC2Loss(tau)
+        return self.loss_fn(h1, h2)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
         return optimizer
-
-    def _step(self, x: Tensor):
-        z = self.encoder(x)
-        h, h_p = self.projector(z), self.projector(self.encoder(self.corrupt_fn(x)))
-        x_hat = self.decoder(z)
-        loss = self.loss_fn(h, h_p, x, x_hat)
-
-        return loss
 
     def training_step(self, batch, batch_idx):
         x, _ = batch
@@ -267,3 +166,361 @@ class FWC2v3(pl.LightningModule):
     @torch.inference_mode()
     def get_embeddings(self, x: Tensor) -> Tensor:
         return self.encoder(x)
+
+
+class S2SDClassifier(pl.LightningModule):
+    def __init__(
+            self,
+            encoder_ckpt: str,
+            dim_hidden: int = 256,
+            n_layers: int = 2,
+            num_classes: int = 5,
+            loss_fn: nn.Module = nn.CrossEntropyLoss(),
+            score_fn: torchmetrics.Metric = torchmetrics.Accuracy(task="multiclass", num_classes=5),
+            lr: float = 1e-3
+    ) -> None:
+        super().__init__()
+
+        self.save_hyperparameters()
+
+        self.encoder = S2SDEncoder.load_from_checkpoint(encoder_ckpt)
+        self.loss_fn = loss_fn
+        self.score_func = score_fn
+
+        self.classifier = nn.Sequential(
+            LazyMLP(n_layers=n_layers, dim_hidden=dim_hidden), nn.Linear(dim_hidden, num_classes)
+        )
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        return optimizer
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.encoder(x)
+        return self.classifier(h)
+
+    def _step(self, x: Tensor, y: Tensor):
+        predictions = self(x)
+
+        loss = self.score_func(predictions, y)
+        score = self.score_func(predictions, y)
+
+        return loss, score
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+
+        loss, score = self._step(x, y)
+
+        metrics = {"train_loss": loss, "train_acc": score}
+        self.log_dict(
+            metrics,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+        )
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+
+        loss, score = self._step(x, y)
+
+        metrics = {"val_loss": loss, "val_acc": score}
+        self.log_dict(
+            metrics,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+        )
+        return loss
+
+# ***************
+class FWC2AEv3(pl.LightningModule):
+    def __init__(
+            self,
+            in_dim: int,
+            hidden_dim: int,
+            encoder_layers: int,
+            lr: float = 1e-3,
+            dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+
+        self.save_hyperparameters()
+
+        encoder_arch = find_net_arch(hidden_dim, encoder_layers, factor=2)
+        decoder_arch = encoder_arch.reverse()
+
+        print(f'encoder layers = {encoder_arch}')
+        print(f'decoder layers = {decoder_arch}')
+
+        self.encoder = MLP(in_dim, encoder_arch, dropout)
+        self.decoder = MLP(hidden_dim, decoder_arch, dropout)
+        self.loss_fn = nn.MSELoss()
+
+    def _step(self, x: Tensor):
+        x_hat = self.decoder(self.encoder(x))
+
+        return self.loss_fn(x, x_hat)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        return optimizer
+
+    def training_step(self, batch, batch_idx):
+        x, _ = batch
+
+        loss = self._step(x)
+
+        self.log('train_loss', loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, _ = batch
+
+        loss = self._step(x)
+
+        self.log('val_loss', loss, prog_bar=True)
+
+    @torch.inference_mode()
+    def get_embeddings(self, x: Tensor) -> Tensor:
+        return self.encoder(x)
+
+# *********************************
+# class MaskGenerator(nn.Module):
+#     """Module for generating Bernoulli mask."""
+#
+#     def __init__(self, p: float):
+#         super().__init__()
+#         self.p = p
+#
+#     def forward(self, x: torch.tensor):
+#         """Generate Bernoulli mask."""
+#         p_mat = torch.ones_like(x) * self.p
+#         return torch.bernoulli(p_mat)
+#
+#
+# class PretextGenerator(nn.Module):
+#     """Module for generating training pretext."""
+#
+#     def __init__(self):
+#         super().__init__()
+#
+#     @staticmethod
+#     def shuffle(x: torch.tensor):
+#         """Shuffle each column in a tensor."""
+#         m, n = x.shape
+#         x_bar = torch.zeros_like(x)
+#         for i in range(n):
+#             idx = torch.randperm(m)
+#             x_bar[:, i] += x[idx, i]
+#         return x_bar
+#
+#     def forward(self, x: torch.tensor, mask: torch.tensor):
+#         """Generate corrupted features and corresponding mask."""
+#         shuffled = self.shuffle(x)
+#         corrupt_x = x * (1.0 - mask) + shuffled * mask
+#         return corrupt_x
+#
+#
+# class LinearLayer(nn.Module):
+#     """
+#     Module to create a sequential block consisting of:
+#
+#         1. Linear layer
+#         2. (optional) Batch normalization layer
+#         3. ReLu activation layer
+#     """
+#
+#     def __init__(self, input_size: int, output_size: int, batch_norm: bool = False):
+#         super().__init__()
+#         self.size_in = input_size
+#         self.size_out = output_size
+#         if batch_norm:
+#             self.model = nn.Sequential(
+#                 nn.Linear(input_size, output_size),
+#                 nn.BatchNorm1d(output_size),
+#                 nn.ReLU(),
+#             )
+#         else:
+#             self.model = nn.Sequential(nn.Linear(input_size, output_size), nn.ReLU())
+#
+#     def forward(self, x: torch.tensor):
+#         """Run inputs through linear block."""
+#         return self.model(x)
+#
+#
+# class LazyMLP(nn.Module):
+#     def __init__(self, n_layers: int, dim_hidden: int, batch_norm: bool = False):
+#         super().__init__()
+#         self.n_layers = n_layers
+#         self.dim_hidden = dim_hidden
+#         if batch_norm:
+#             lazy_block = nn.Sequential(
+#                 nn.LazyLinear(dim_hidden),
+#                 nn.BatchNorm1d(dim_hidden),
+#                 nn.ReLU(),
+#             )
+#         else:
+#             lazy_block = nn.Sequential(nn.LazyLinear(dim_hidden), nn.ReLU())
+#
+#         self.model = nn.Sequential(
+#             lazy_block,
+#             *[LinearLayer(dim_hidden, dim_hidden, batch_norm) for _ in range(n_layers - 1)],
+#         )
+#
+#     def forward(self, x: torch.tensor):
+#         """Run inputs through linear block."""
+#         return self.model(x)
+#
+#
+# class SCARFEncoder(pl.LightningModule):
+#     def __init__(
+#         self,
+#         dim_hidden: int = 256,
+#         n_encoder_layers: int = 4,
+#         n_projection_layers: int = 2,
+#         p_mask: float = 0.6,
+#         loss_func: nn.Module = losses.SelfSupervisedLoss(losses.NTXentLoss(temperature=1.0)),
+#         optim: Optional[torch.optim.Optimizer] = None,
+#         scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+#         batch_norm: bool = False,
+#     ):
+#         super().__init__()
+#
+#         self.loss_func = loss_func
+#         self.optim = optim
+#         self.scheduler = scheduler
+#
+#         self.save_hyperparameters(ignore=["loss_func"])
+#
+#         self.get_mask = MaskGenerator(p=p_mask)
+#         self.corrupt = PretextGenerator()
+#
+#         self.encoder = LazyMLP(
+#             n_layers=n_encoder_layers, dim_hidden=dim_hidden, batch_norm=batch_norm
+#         )
+#         self.projection = LazyMLP(
+#             n_layers=n_projection_layers, dim_hidden=dim_hidden, batch_norm=batch_norm
+#         )
+#
+#     def configure_optimizers(self):
+#         optim = self.optim(self.parameters()) if self.optim else torch.optim.Adam(self.parameters())
+#         if self.scheduler:
+#             scheduler = self.scheduler(optim)
+#             return {
+#                 "optimizer": optim,
+#                 "lr_scheduler": {
+#                     "scheduler": scheduler,
+#                     "monitor": "train-loss",
+#                     "interval": "epoch",
+#                 },
+#             }
+#         return optim
+#
+#     def forward(self, x) -> torch.Tensor:
+#         return self.encoder(x)
+#
+#     def encode(self, x) -> torch.Tensor:
+#         self.encoder.eval()
+#         with torch.no_grad():
+#             return self.encoder(x)
+#
+#     def training_step(self, batch, idx):
+#         x = batch[0]
+#         mask = self.get_mask(x)
+#         x_corrupt = self.corrupt(x, mask)
+#         enc_x, enc_corrupt = self(x), self(x_corrupt)
+#         proj_x, proj_corrupt = self.projection(enc_x), self.projection(enc_corrupt)
+#         loss = self.loss_func(proj_corrupt, proj_x)
+#
+#         self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=False)
+#         metrics = {"train-loss": loss}
+#         self.log_dict(
+#             metrics,
+#             on_step=False,
+#             on_epoch=True,
+#             prog_bar=True,
+#             logger=True,
+#         )
+#         return loss
+#
+#     def validation_step(self, batch, idx):
+#         x_corrupt, x = batch
+#         enc_x, enc_corrupt = self(x), self(x_corrupt)
+#         proj_x, proj_corrupt = self.projection(enc_x), self.projection(enc_corrupt)
+#         loss = self.loss_func(proj_corrupt, proj_x)
+#
+#         self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=False)
+#         metrics = {"valid-loss": loss}
+#         self.log_dict(
+#             metrics,
+#             on_step=False,
+#             on_epoch=True,
+#             prog_bar=True,
+#             logger=True,
+#         )
+#         return loss
+#
+#
+# class SCARFLearner(pl.LightningModule):
+#     def __init__(
+#         self,
+#         encoder_ckpt: str,
+#         dim_hidden: int = 256,
+#         n_layers: int = 2,
+#         num_classes: int = 7,
+#         loss_func: nn.Module = nn.CrossEntropyLoss(),
+#         score_func: torchmetrics.Metric = Accuracy(task="multiclass", num_classes=7),
+#         optim: Optional[torch.optim.Optimizer] = None,
+#         scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+#     ):
+#         super().__init__(loss_func=loss_func, optim=optim, scheduler=scheduler)
+#
+#         self.encoder = SCARFEncoder.load_from_checkpoint(encoder_ckpt)
+#         self.score_func = score_func
+#
+#         self.classifier = nn.Sequential(
+#             LazyMLP(n_layers=n_layers, dim_hidden=dim_hidden), nn.Linear(dim_hidden, num_classes)
+#         )
+#
+#     def forward(self, x) -> torch.Tensor:
+#         embd = self.encoder(x)
+#         return self.classifier(embd)
+#
+#     def training_step(self, batch, idx):
+#         x, y = batch
+#         preds = self(x)
+#         loss = self.loss_func(preds, y)
+#         score = self.score_func(preds, y)
+#
+#         self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=False)
+#         metrics = {"train-loss": loss, "train-acc": score}
+#         self.log_dict(
+#             metrics,
+#             on_step=False,
+#             on_epoch=True,
+#             prog_bar=False,
+#             logger=True,
+#         )
+#         return loss
+#
+#     def validation_step(self, batch, idx):
+#         x, y = batch
+#         preds = self(x)
+#         loss = self.loss_func(preds, y)
+#         score = self.score_func(preds, y)
+#
+#         self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=False)
+#         metrics = {"valid-loss": loss, "valid-acc": score}
+#         self.log_dict(
+#             metrics,
+#             on_step=False,
+#             on_epoch=True,
+#             prog_bar=False,
+#             logger=True,
+#         )
+#         return loss

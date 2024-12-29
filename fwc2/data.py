@@ -2,12 +2,16 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-class FWC2Dataset(Dataset):
-    def __init__(self, data, target, columns=None, labels=None):
+class NetFlowDataset(Dataset):
+    def __init__(
+            self,
+            data,
+            labels=None,
+            columns=None,
+    ):
         self.data = np.array(data)
-        self.target = np.array(target)
+        self.labels = np.array(labels)
         self.columns = columns
-        self.labels = labels
 
     @property
     def features_low(self):
@@ -22,7 +26,7 @@ class FWC2Dataset(Dataset):
         return self.data.shape
 
     def __getitem__(self, index):
-        return torch.tensor(self.data[index], dtype=torch.float32), torch.tensor(self.target[index], dtype=torch.long)
+        return torch.tensor(self.data[index], dtype=torch.float32), torch.tensor(self.labels[index], dtype=torch.long)
 
     def __len__(self):
         return len(self.data)

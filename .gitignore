@@ -6,3 +6,4 @@ lightning_logs/*
 .idea
 wandb
 fwc2-two-stage-learning
+.env

@@ -290,21 +290,25 @@ def main(
     pl.seed_everything(SEED)
 
     # wandb
-    wandb_logger = WandbLogger(project='fwc2-hybrid-ssl-learning', log_model=True)
-    wandb_logger.experiment.config["dataset"] = ds_name
-    wandb_logger.experiment.config["batch_size"] = batch_size
-    wandb_logger.experiment.config["corruption_rate"] = cp
-    wandb_logger.experiment.config["temprature"] = tau
+    # wandb_logger = WandbLogger(project='fwc2-hybrid-ssl-learning', log_model=True)
+    # wandb_logger.experiment.config["dataset"] = ds_name
+    # wandb_logger.experiment.config["batch_size"] = batch_size
+    # wandb_logger.experiment.config["corruption_rate"] = cp
+    # wandb_logger.experiment.config["temprature"] = tau
 
     train_set, test_set = load_data(ds_name)
+
     train_set_size = int(len(train_set) * 0.8)
     valid_set_size = len(train_set) - train_set_size
     seed = torch.Generator().manual_seed(SEED)
-    train_set, valid_set = random_split(train_set, [train_set_size, valid_set_size], generator=seed)
+    train_set, valid_set = random_split(
+        train_set,
+        [train_set_size, valid_set_size],
+        generator=seed
+    )
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=15,
-                              persistent_workers=True)
-    val_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=15,
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8)
+    val_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=8,
                             persistent_workers=True)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
 
@@ -312,15 +316,20 @@ def main(
     print(f'**** PRETRAINING - CORRUPT_RATE = {cp} ***')
     print(f'******************************************')
 
-    encoder_dims = [128, 64, 32, 16]
-    projection_dims = [8, 8]
-    decoder_dims = [16, 32, in_dim]
+    # encoder_dims = [128, 64, 32, 16]
+    # projection_dims = [8, 8]
+    # decoder_dims = [16, 32, in_dim]
 
     model = FWC2v3(
         in_dim=in_dim,
-        encoder_dims=encoder_dims,
-        decoder_dims=decoder_dims,
-        projector_dims=projection_dims,
+        hidden_dim=8,
+        projection_dim=8,
+        encoder_layers=3,
+        decoder_layers=2,
+        projection_layers=2,
+        # encoder_dims=encoder_dims,
+        # decoder_dims=decoder_dims,
+        # projector_dims=projection_dims,
         corrupt_rate=cp,
         features_low=train_set.dataset.features_low,
         features_high=train_set.dataset.features_high,
