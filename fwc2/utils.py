@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 from sklearn.manifold import TSNE
@@ -108,56 +110,58 @@ def find_net_arch(out_dim, num_hidden, factor=1.0):
     return archi
 
 
-# def tsne_scatter(features, labels, dimensions=2, save_as='graph.png', notebook=False):
-#     sns.set(style='whitegrid', context='notebook')
-#
-#     print(f'{features.shape} , {labels.shape}')
-#     print(f'{labels.value_counts()}')
-#
-#     if dimensions not in (2, 3):
-#         raise ValueError(
-#             'tsne_scatter can only plot in 2d or 3d (What are you? An alien that can visualise >3d?). Make sure the "dimensions" argument is in (2, 3)')
-#
-#     features_embedded = TSNE(
-#         n_components=dimensions,
-#         perplexity=30,
-#         random_state=42,
-#         n_jobs=8
-#     ).fit_transform(features)
-#
-#     fig, ax = plt.subplots(figsize=(8, 8))
-#
-#     if dimensions == 3: ax = fig.add_subplot(111, projection='3d')
-#
-#     ax.scatter(
-#         *zip(*features_embedded[np.where(labels != 'benign')]),
-#         marker='o',
-#         color='r',
-#         s=2,
-#         alpha=0.7,
-#         label='Attack'
-#     )
-#     ax.scatter(
-#         *zip(*features_embedded[np.where(labels == 'benign')]),
-#         marker='o',
-#         color='b',
-#         s=2,
-#         alpha=0.3,
-#         label='Benign'
-#     )
-#
-#     plt.legend(loc='best')
-#
-#     plt.savefig(save_as)
-#
-#     if notebook:
-#         plt.show()
-#
-#     return fig
+def tsne_scatter_anomaly(features, labels, dimensions=2, save_as='graph.png', notebook=False):
+    sns.set(style='white', context='notebook')
+
+    print(f'{features.shape} , {labels.shape}')
+    print(f'{labels.value_counts()}')
+
+    if dimensions not in (2, 3):
+        raise ValueError(
+            'tsne_scatter can only plot in 2d or 3d (What are you? An alien that can visualise >3d?). Make sure the "dimensions" argument is in (2, 3)')
+
+    features_embedded = TSNE(
+        n_components=dimensions,
+        perplexity=30,
+        random_state=42,
+        n_jobs=8
+    ).fit_transform(features)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    if dimensions == 3: ax = fig.add_subplot(111, projection='3d')
+
+    colors = sns.color_palette("tab10", 2)
+
+    ax.scatter(
+        *zip(*features_embedded[np.where(labels == 1)]),
+        marker='o',
+        color=colors[0],
+        s=2,
+        alpha=0.7,
+        label='Attack'
+    )
+    ax.scatter(
+        *zip(*features_embedded[np.where(labels == 0)]),
+        marker='o',
+        color=colors[0],
+        s=2,
+        alpha=0.3,
+        label='Benign'
+    )
+
+    plt.legend(loc='best')
+
+    plt.savefig(save_as, bbox_inches='tight', dpi=300, format='svg')
+
+    if notebook:
+        plt.show()
+
+    return fig
 
 
 def tsne_scatter(features, labels, dimensions=2, save_as='graph.png', notebook=False):
-    sns.set(style='whitegrid', context='notebook')
+    sns.set(style='white', context='notebook')
 
     print(f'{features.shape} , {labels.shape}')
     unique_labels = np.unique(labels)
@@ -178,7 +182,7 @@ def tsne_scatter(features, labels, dimensions=2, save_as='graph.png', notebook=F
     if dimensions == 3:
         ax = fig.add_subplot(111, projection='3d')
 
-    colors = sns.color_palette("hsv", len(unique_labels))
+    colors = sns.color_palette("tab10", len(unique_labels))
 
     for label, color in zip(unique_labels, colors):
         indices = np.where(labels == label)
@@ -191,10 +195,43 @@ def tsne_scatter(features, labels, dimensions=2, save_as='graph.png', notebook=F
             label=label
         )
 
-    plt.legend(loc='best', title="Machines")
+    plt.legend(loc='best', title="Stage")
     plt.savefig(save_as)
 
     if notebook:
         plt.show()
 
     return fig
+
+def plot_precision_recall_curve(recall, precision, avg_precision, save_as='figure.svg', notebook=False):
+    plt.figure(figsize=(6, 4))
+    plt.plot(recall, precision, label=f'AP = {avg_precision:.3f}', linewidth=2)
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.legend(loc='best')
+    plt.grid(True)
+
+    figs_dir = f'./figs/{datetime.now().strftime("%Y-%m-%d")}/pr_curves'
+    os.makedirs(figs_dir, exist_ok=True)
+
+    plt.savefig(f'{figs_dir}/{save_as}', bbox_inches='tight', dpi=300, format='svg')
+
+    if notebook:
+        plt.show()
+
+def plot_roc_curve(fpr, tpr, auc, save_as='figure.svg', notebook=False):
+    plt.figure(figsize=(6, 4))
+    plt.plot(fpr, tpr, label=f'AUC-ROC = {auc:.3f}', linewidth=2)
+    plt.xlabel('FPR')
+    plt.ylabel('TPR')
+    plt.legend(loc='best')
+    plt.grid(True)
+
+    figs_dir = f'./figs/{datetime.now().strftime("%Y-%m-%d")}/roc_curves'
+    os.makedirs(figs_dir, exist_ok=True)
+
+    plt.savefig(f'{figs_dir}/{save_as}', bbox_inches='tight', dpi=300, format='svg')
+
+    if notebook:
+        plt.show()
+

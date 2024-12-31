@@ -15,10 +15,14 @@ from typing import Optional
 
 
 class RandomFeatureCorruption:
-    def __init__(self, corruption_rate: float = 0.6, features_low: numpy.ndarray = None,
+    def __init__(self,
+                 corruption_rate: float = 0.6,
+                 corrupt_both_views: bool = True,
+                 features_low: numpy.ndarray = None,
                  features_high: numpy.ndarray = None):
-        self.marginals = Uniform(torch.Tensor(features_low), torch.Tensor(features_high))
         self.corruption_rate = corruption_rate
+        self.corrupt_both_views = corrupt_both_views
+        self.marginals = Uniform(torch.Tensor(features_low), torch.Tensor(features_high))
 
     def __call__(self, x):
         bs, _ = x.size()
@@ -27,9 +31,12 @@ class RandomFeatureCorruption:
         x_random = self.marginals.sample(torch.Size((bs,))).to(x.device)
 
         xc1 = torch.where(mask, x_random, x)
-        xc2 = torch.where(~mask, x_random, x)
 
-        return xc1, xc2
+        if self.corrupt_both_views:
+            xc2 = torch.where(~mask, x_random, x)
+            return xc1, xc2
+
+        return xc1, x
 
 
 class MLP(torch.nn.Sequential):

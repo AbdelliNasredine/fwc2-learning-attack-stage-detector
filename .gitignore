@@ -1,5 +1,5 @@
 .envs
-datasets/*
+datasets
 output
 lightning_logs
 lightning_logs/*
@@ -7,3 +7,8 @@ lightning_logs/*
 wandb
 fwc2-two-stage-learning
 .env
+results
+s2sd-detector-local
+fwc2-hybrid-ssl-learning-anomaly
+fwc2-hybrid-ssl-learning-anomaly-local
+figs

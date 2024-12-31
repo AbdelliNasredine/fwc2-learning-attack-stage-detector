@@ -1,16 +1,31 @@
-from lightning_sdk import Studio, Machine
+from itertools import product
+import train_v4
 
-studio = Studio()
+datasets = [('dapt20', 5)]
+enc_depth = [2, 3, 4]
+prj_depth = [1, 2]
+h_dim = [64, 128, 256]
+l_rates = [0.01, 0.001]
+batch_sizes = [1024]
+c_rates = [round(i * 0.1, 1) for i in range(1, 10)]
+c_both_v = [False, True]
+tau = [1]
 
-studio.install_plugin('jobs')
-job_plugin = studio.installed_plugins['jobs']
 
-learning_rates = [1e-4, 1e-3, 1e-2]
-batch_sizes = [32, 64, 128]
+grid_search_params = list(product(datasets, enc_depth, prj_depth, h_dim, l_rates, batch_sizes, c_rates, c_both_v, tau))
 
-grid_search_params = [(lr, bs) for lr in learning_rates for bs in batch_sizes]
-
-for index, (lr, bs) in enumerate(grid_search_params):
-    cmd = f'python finetune_sweep.py --lr {lr} --batch_size {bs} --max_steps {100}'
-    job_name = f'run-2-exp-{index}'
-    job_plugin.run(cmd, machine=Machine.A10G, name=job_name)
+for combination in grid_search_params:
+    ds, enc_depth, prj_depth, h_dim, l_rate, batch_size, c_rate, c_both_v, tau = combination
+    train_v4.main_fn(
+        ds_name=ds[0],
+        num_stages=ds[1],
+        encoder_hidden_dim=h_dim,
+        n_encoder_layers=enc_depth,
+        n_projection_layers=prj_depth,
+        cp=c_rate,
+        corrupt_both_views=c_both_v,
+        tau=tau,
+        learning_rate=l_rate,
+        batch_size=batch_size,
+        plot_tsne=False,
+    )

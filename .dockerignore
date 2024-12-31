@@ -7,3 +7,4 @@ lightning_logs/*
 wandb
 fwc2-two-stage-learning
 expirements
+results
