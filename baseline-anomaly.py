@@ -1,20 +1,92 @@
+import os
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import lightning.pytorch as pl
 
 from argparse import ArgumentParser
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
-from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, precision_recall_curve, average_precision_score
+from sklearn.metrics import classification_report, f1_score, precision_score, recall_score, roc_auc_score, auc, \
+    precision_recall_curve, average_precision_score
 
 
-def main(dataset_name: str = 'dapt20'):
+class DS(Dataset):
+    def __init__(self, data):
+        self.data = torch.tensor(data, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+class AE(pl.LightningModule):
+    def __init__(self, input_size):
+        super(AE, self).__init__()
+
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(input_size, 60),
+            torch.nn.ReLU(),
+            torch.nn.Linear(60, 35),
+            torch.nn.ReLU(),
+            torch.nn.Linear(35, 20),
+            torch.nn.ReLU()
+        )
+
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(20, 35),
+            torch.nn.ReLU(),
+            torch.nn.Linear(35, 60),
+            torch.nn.ReLU(),
+            torch.nn.Linear(60, input_size),
+            torch.nn.Sigmoid()
+        )
+
+        self.loss_fn = torch.nn.MSELoss()
+
+    def forward(self, x):
+        x = self.encoder(x)
+        return self.decoder(x)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.01)
+        return optimizer
+
+    def training_step(self, batch, batch_idx):
+        x = batch
+
+        x_hat = self(x)
+        loss = self.loss_fn(x_hat, x)
+
+        self.log('train_loss', loss, prog_bar=True)
+
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        x = batch
+        x_hat = self(x)
+        loss = self.loss_fn(x_hat, x)
+
+        self.log('test_loss', loss)
+
+        return loss
+
+
+def train_eval(dataset_name: str = 'dapt20', model: str = 'IF'):
     print(f'** EXPERIMENT WITH {dataset_name}')
 
     train_set = pd.read_csv(f'./data/{dataset_name}/anomaly/train.csv')
     test_set = pd.read_csv(f'./data/{dataset_name}/anomaly/test.csv')
+
+    in_dim = train_set.shape[1] - 1
 
     scaler = StandardScaler()
     X_train, y_train = train_set.drop(columns=['label']), train_set['label']
@@ -25,65 +97,65 @@ def main(dataset_name: str = 'dapt20'):
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
 
-    # model = IsolationForest(random_state=42, contamination=0.2, n_estimators=150)
-    # model.fit(X_train)
-    #
-    # scores = model.decision_function(X_test)
-    # preds = model.predict(X_test)
-    #
-    #
+    auc_roc, auc_pr = 0, 0
 
-
-    h_contamination = [0.01, 0.05, 0.1, 0.2]
-    h_n_estimators = [50, 100, 150, 250]
-
-    grid_search_params = [(c, ne) for c in h_contamination for ne in h_n_estimators]
-
-    h_metrics = []
-    for index, (c, ne) in enumerate(grid_search_params):
-        model = IsolationForest(contamination=c, n_estimators=ne, random_state=42)
+    if model == 'IF':
+        model = IsolationForest(random_state=42)
 
         model.fit(X_train)
 
-        scores = model.decision_function(X_test)
-        y_pred = pd.Series(model.predict(X_test)).replace([-1, 1], [1, 0])
+        scores = (-1.0) * model.decision_function(X_test)
 
-        print(f'min score = {np.min(scores)} max score = {np.max(scores)}')
+        auc_roc = roc_auc_score(y_test, scores)
+        precision, recall, _ = precision_recall_curve(y_test, scores)
+        auc_pr = auc(recall, precision)
 
-        precision, recall, thresholds = precision_recall_curve(y_test, -scores)
-        ap = average_precision_score(y_test, -scores)
-        cm = confusion_matrix(y_test, y_pred)
+    if model == 'AE':
+        train_loader = DataLoader(DS(X_train), batch_size=32, shuffle=True)
+        test_loader = DataLoader(DS(X_test), batch_size=32)
 
-        # 5. Plot the PR curve
-        plt.figure(figsize=(6, 4))
-        plt.plot(recall, precision, label=f'AP = {ap:.2f}, ne = {ne}, c = {c}', linewidth=2)
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.title('Precision-Recall Curve (IsolationForest)')
-        plt.legend(loc='lower left')
-        plt.grid(True)
-        plt.savefig(f'./figs/if-AP-cure-{dataset_name}-hp-idx-{index}.svg', bbox_inches='tight', dpi=300, format='svg')
+        model = AE(input_size=in_dim)
+        trainer = pl.Trainer(max_epochs=10, enable_progress_bar=True)
+        trainer.fit(model, train_loader)
+        trainer.test(model, test_loader)
 
-        print("Average Precision (AP):", ap)
+        model.eval()
+        scores = []
+        with torch.no_grad():
+            for x in test_loader:
+                x_hat = model(x)
+                batch_errors = torch.mean((x_hat - x) ** 2, dim=1).cpu().numpy()
+                scores.extend(batch_errors)
+        scores = np.array(scores)
 
-        # acc = accuracy_score(y_test, y_pred)
-        # f1 = f1_score(y_test, y_pred)
-        #
-        # print(f'*** c = {c} , ne = {ne}')
-        # print(f'acc= {acc}, f1 = {f1}')
+        auc_roc = roc_auc_score(y_test, scores)
+        precision, recall, _ = precision_recall_curve(y_test, scores)
+        auc_pr = auc(recall, precision)
 
-        h_metrics.append(ap)
+    return auc_roc, auc_pr
 
-    best_h_idx = np.argmax(h_metrics)
-
-    print('*********')
-    print(f'best h param with f1 = {h_metrics[best_h_idx]} is {grid_search_params[best_h_idx]}')
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
+    # datasets = ['dapt20', 'mscad', 'scvic21']
+    datasets = ['dapt20']
+    models = ['IF', 'AE']
 
-    parser.add_argument("--ds", type=str, default='dapt20')
+    log = {
+        'dataset': [],
+        'model': [],
+        'auc_roc': [],
+        'auc_pr': [],
+    }
+    for dataset in datasets:
+        for model in models:
+            auc_roc, auc_pr = train_eval(dataset, model=model)
+            log['model'].append(model)
+            log['dataset'].append(dataset)
+            log['auc_roc'].append(auc_roc)
+            log['auc_pr'].append(auc_pr)
 
-    args = parser.parse_args()
+    log_dir = f'./results/{datetime.now().strftime("%Y-%m-%d")}-anomaly-baseline/'
 
-    main(args.ds)
+    os.makedirs(log_dir, exist_ok=True)
+
+    pd.DataFrame(log).to_csv(f'{log_dir}/log.csv', index=False)

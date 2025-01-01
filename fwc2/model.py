@@ -74,14 +74,6 @@ class MLPv2(torch.nn.Sequential):
 
 
 class LinearLayer(nn.Module):
-    """
-    Module to create a sequential block consisting of:
-
-        1. Linear layer
-        2. (optional) Batch normalization layer
-        3. ReLu activation layer
-    """
-
     def __init__(self, input_size: int, output_size: int, batch_norm: bool = False):
         super().__init__()
         self.size_in = input_size
@@ -96,7 +88,6 @@ class LinearLayer(nn.Module):
             self.model = nn.Sequential(nn.Linear(input_size, output_size), nn.ReLU())
 
     def forward(self, x: torch.tensor):
-        """Run inputs through linear block."""
         return self.model(x)
 
 
@@ -137,7 +128,7 @@ class S2SDEncoder(pl.LightningModule):
     ) -> None:
         super().__init__()
 
-        self.save_hyperparameters(ignore=['corrupt_fn'])
+        self.save_hyperparameters(ignore=['corrupt_fn', 'loss_fn'])
 
         self.loss_fn = loss_fn
         self.corrupt_fn = corrupt_fn

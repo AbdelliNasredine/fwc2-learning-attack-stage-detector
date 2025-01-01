@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 import pytorch_metric_learning.losses as losses
 
@@ -24,7 +25,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, precision_recall_curve, auc, \
     roc_curve, average_precision_score
 
-from fwc2.model import S2SDEncoder, S2SDClassifier, RandomFeatureCorruption
+from fwc2.model import S2SDEncoder, RandomFeatureCorruption
 from fwc2.data import NetFlowDataset
 from fwc2.utils import load_train_test_sets, tsne_scatter_anomaly, plot_precision_recall_curve, plot_roc_curve
 
@@ -33,17 +34,13 @@ SEED = 42
 
 def main_fn(
         ds_name: str,
-        num_stages: int,
         encoder_hidden_dim: int = 256,
-        classifier_hidden_dim: int = 256,
         n_encoder_layers: int = 4,
         n_projection_layers: int = 2,
-        n_classifier_layers: int = 2,
         cp: float = 0.4,
         corrupt_both_views: bool = True,
         tau: float = 1.0,
         max_pretrain_epochs: int = 200,
-        max_finetune_epochs: int = 50,
         learning_rate: float = 1e-3,
         batch_size: int = 256,
         plot_tsne: bool = False,
@@ -52,22 +49,24 @@ def main_fn(
     print(f'****************************')
     print(f'*** EXPERIMENT PARAMS *****')
     print(f'*** dataset = {ds_name} ')
-    print(f'*** #stages = {num_stages}')
     print(f'*** encoder_hidden_dim = {encoder_hidden_dim} ')
-    print(f'*** classifier_hidden_dim = {classifier_hidden_dim} ')
     print(f'*** #encoder layers = {n_encoder_layers} ')
     print(f'*** #project layers = {n_projection_layers} ')
-    print(f'*** #classify layers = {n_classifier_layers} ')
     print(f'*** corrupt_rate = {cp} ')
     print(f'*** corrupt_both_views = {corrupt_both_views} ')
     print(f'*** tau = {tau} ')
     print(f'*** max_pretrain_epochs = {max_pretrain_epochs}')
-    print(f'*** max_finetune_epochs = {max_finetune_epochs}')
     print(f'*** learning_rate = {learning_rate}')
     print(f'*** batch_size = {batch_size}')
     print(f'****************************')
 
     load_dotenv()
+
+    log_dir = f'./results/{datetime.now().strftime("%Y-%m-%d")}/{ds_name}/hdim={encoder_hidden_dim},el={n_encoder_layers},pl={n_projection_layers},c={cp}'
+
+    print(f'log folder = {log_dir}')
+
+    os.makedirs(log_dir, exist_ok=True)
 
     pl.seed_everything(SEED)
 
@@ -77,10 +76,8 @@ def main_fn(
     wandb_logger = WandbLogger(project=wandb_prj_name, log_model=True)
     wandb_logger.experiment.config["dataset"] = ds_name
     wandb_logger.experiment.config["encoder_hidden_dim"] = encoder_hidden_dim
-    wandb_logger.experiment.config["classifier_hidden_dim"] = classifier_hidden_dim
     wandb_logger.experiment.config["n_encoder_layers"] = n_encoder_layers
     wandb_logger.experiment.config["n_projection_layers"] = n_projection_layers
-    wandb_logger.experiment.config["n_classifier_layers"] = n_classifier_layers
     wandb_logger.experiment.config["batch_size"] = batch_size
     wandb_logger.experiment.config["corruption_rate"] = cp
     wandb_logger.experiment.config["corruption_both_views"] = corrupt_both_views
@@ -94,7 +91,7 @@ def main_fn(
     test_X, test_y = test_set.drop(columns=['label']), test_set['label']
 
     label_encoder = LabelEncoder()
-    scaler = MinMaxScaler()
+    scaler = StandardScaler()
     pipline = Pipeline([('scale', scaler)])
 
     pipline.fit(train_X)
@@ -123,16 +120,11 @@ def main_fn(
         batch_norm=True,
     )
 
-    early_stopping = EarlyStopping(
-        monitor="val_loss",
-        patience=10,
-        min_delta=0.001,
-        verbose=True,
-        mode="min",
-    )
+    early_stopping = EarlyStopping(monitor="val_loss", patience=3, min_delta=0.001, verbose=True, mode="min")
+    model_checkpoint = ModelCheckpoint(dirpath=log_dir, monitor='val_loss', save_top_k=1, mode='min')
     trainer = pl.Trainer(
         max_epochs=max_pretrain_epochs,
-        callbacks=[early_stopping],
+        callbacks=[model_checkpoint, early_stopping],
         logger=wandb_logger,
         log_every_n_steps=1,
         deterministic=True,
@@ -141,28 +133,30 @@ def main_fn(
 
     print(f'*** ANOMALY DETECTION MODEL STEP ***')
 
+    model = S2SDEncoder.load_from_checkpoint(model_checkpoint.best_model_path)
+
     test_X = pipline.transform(test_X)
     test_y = test_y.apply(lambda x: 1 if x != 'benign' else 0)
 
     train_Z = model.get_embeddings(torch.tensor(np.array(train_X), dtype=torch.float32))
     test_Z = model.get_embeddings(torch.tensor(np.array(test_X), dtype=torch.float32))
 
-    h_contamination = [0.01, 0.05, 0.1, 0.2]
+    h_max_samples = [128, 256, 512]
     h_n_estimators = [50, 100, 150, 250]
-    grid_search_params = [(c, ne) for c in h_contamination for ne in h_n_estimators]
+    grid_search_params = [(ms, ne) for ms in h_max_samples for ne in h_n_estimators]
 
     log = {
-        'contamination': [],
+        'max_samples': [],
         'n_estimators': [],
         'accuracy': [],
         'precision': [],
         'recall': [],
         'f1': [],
-        'avg_precision': [],
-        'roc_auc': [],
+        'auc_pr': [],
+        'auc_roc': [],
     }
-    for idx, (c, ne) in enumerate(grid_search_params):
-        anomaly_detector = IsolationForest(n_estimators=ne, contamination=c, random_state=SEED)
+    for idx, (ms, ne) in enumerate(grid_search_params):
+        anomaly_detector = IsolationForest(n_estimators=ne, max_samples=ms, random_state=SEED)
         anomaly_detector.fit(train_Z.numpy())
 
         scores = anomaly_detector.decision_function(test_Z.numpy())
@@ -174,42 +168,33 @@ def main_fn(
         f1 = f1_score(test_y, y_pred)
 
         precisions, recalls, thresholds = precision_recall_curve(test_y, -scores)
-        ap = average_precision_score(test_y, -scores)
+        auc_pr = auc(recalls, precisions)
 
         fpr, tpr, threshold = roc_curve(test_y, scores)
-        roc_auc = auc(fpr, tpr)
+        auc_roc = auc(fpr, tpr)
 
-        plot_precision_recall_curve(recalls, precisions, ap, save_as=f'if-hparam-{idx}.svg')
-        plot_roc_curve(fpr, tpr, roc_auc, save_as=f'if-hparam-{idx}.svg')
+        # plot_precision_recall_curve(recalls, precisions, auc_pr, save_as=f'if-hparam-ms-{ms}-ne-{ne}.svg')
+        # plot_roc_curve(fpr, tpr, auc_roc, save_as=f'if-hparam-ms-{ms}-ne-{ne}.svg')
 
-        log['contamination'].append(c)
+        log['max_samples'].append(ms)
         log['n_estimators'].append(ne)
         log['accuracy'].append(acc)
         log['precision'].append(precision)
         log['recall'].append(recall)
         log['f1'].append(f1)
-        log['avg_precision'].append(ap)
-        log['roc_auc'].append(roc_auc)
+        log['auc_pr'].append(auc_pr)
+        log['auc_roc'].append(auc_roc)
 
-    log["dataset"] = [ds_name] * 16
-    log["encoder_hidden_dim"] = [encoder_hidden_dim] * 16
-    log["classifier_hidden_dim"] = [classifier_hidden_dim] * 16
-    log["n_encoder_layers"] = [n_encoder_layers] * 16
-    log["n_projection_layers"] = [n_projection_layers] * 16
-    log["n_classifier_layers"] = [n_classifier_layers] * 16
-    log["batch_size"] = [batch_size] * 16
-    log["corruption_rate"] = [cp] * 16
-    log["corruption_both_views"] = [corrupt_both_views] * 16
-    log["tau"] = [tau] * 16
+    log["dataset"] = [ds_name] * 12
+    log["encoder_hidden_dim"] = [encoder_hidden_dim] * 12
+    log["n_encoder_layers"] = [n_encoder_layers] * 12
+    log["n_projection_layers"] = [n_projection_layers] * 12
+    log["batch_size"] = [batch_size] * 12
+    log["corruption_rate"] = [cp] * 12
+    log["corruption_both_views"] = [corrupt_both_views] * 12
+    log["tau"] = [tau] * 12
 
-    best_ap_i = np.argmax(log['avg_precision'])
-    print(f'best if hparam is {grid_search_params[best_ap_i]}, average p = {log["avg_precision"][best_ap_i]}')
-
-    log_name = ''.join(random.sample((string.ascii_uppercase + string.digits) * 6, 6))
-    log_dir = f'./results/{datetime.now().strftime("%Y-%m-%d")}-{log_name}/'
-
-    os.makedirs(log_dir, exist_ok=True)
-    pd.DataFrame(log).to_csv(f'{log_dir}/log.csv', index=False, encoding='utf-8')
+    pd.DataFrame(log).to_csv(f'{log_dir}/metrics.csv', index=False, encoding='utf-8')
 
     # viz embedding
     if plot_tsne:
@@ -224,39 +209,31 @@ if __name__ == "__main__":
     parser = ArgumentParser()
 
     parser.add_argument("--ds", type=str, default='dapt20')
-    parser.add_argument("--ns", type=int, default=5)
     parser.add_argument("--edim", type=int, default=256)
-    parser.add_argument("--cdim", type=int, default=256)
     parser.add_argument("--nel", type=int, default=4)
     parser.add_argument("--npl", type=int, default=2)
-    parser.add_argument("--ncl", type=int, default=2)
     parser.add_argument("--cr", type=float, default=0.1)
     parser.add_argument("--cr_both", action="store_true", default=True)
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--bs", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--mpe", type=int, default=200)
-    parser.add_argument("--mfe", type=int, default=50)
     parser.add_argument("--plot_tsne", action="store_true", default=False)
     parser.add_argument("--wandb_prj", type=str, default="s2sd-detector")
 
     args = parser.parse_args()
 
     main_fn(
-        args.ds,
-        args.ns,
-        args.edim,
-        args.cdim,
-        args.nel,
-        args.npl,
-        args.ncl,
-        args.cr,
-        args.cr_both,
-        args.tau,
-        args.mpe,
-        args.mfe,
-        args.lr,
-        args.bs,
-        args.plot_tsne,
-        args.wandb_prj
+        ds_name=args.ds,
+        encoder_hidden_dim=args.edim,
+        n_encoder_layers=args.nel,
+        n_projection_layers=args.npl,
+        cp=args.cr,
+        corrupt_both_views=args.cr_both,
+        tau=args.tau,
+        batch_size=args.bs,
+        learning_rate=args.lr,
+        max_pretrain_epochs=args.mpe,
+        plot_tsne=args.plot_tsne,
+        wandb_prj_name=args.wandb_prj
     )
