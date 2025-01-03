@@ -1,12 +1,12 @@
 from itertools import product
-import train_v4
+import train_v5
 
 if __name__ == '__main__':
     datasets = ['dapt20', 'mscad']
-    h_dims = [16, 32, 64, 128, 256]
-    enc_depths = [2, 3, 4]
-    prj_depths = [1, 2]
-    batch_sizes = [256]
+    h_dims = [32, 64]
+    enc_depths = [4]
+    prj_depths = [2]
+    batch_sizes = [256, 512, 1024]
     c_rates = [round(i * 0.1, 1) for i in range(1, 10)]
     c_both_v = [False]
     taus = [1]
@@ -16,7 +16,7 @@ if __name__ == '__main__':
 
     for combination in grid_search_params:
         ds, h_dim, enc_depth, prj_depth, batch_size, c_rate, c_both_v, tau = combination
-        train_v4.main_fn(
+        train_v5.main_fn(
             ds_name=ds,
             encoder_hidden_dim=h_dim,
             n_encoder_layers=enc_depth,

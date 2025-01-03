@@ -27,7 +27,7 @@ class RandomFeatureCorruption:
     def __call__(self, x):
         bs, _ = x.size()
 
-        mask = torch.rand_like(x, device=x.device) >= self.corruption_rate
+        mask = torch.rand_like(x, device=x.device) <= self.corruption_rate
         x_random = self.marginals.sample(torch.Size((bs,))).to(x.device)
 
         xc1 = torch.where(mask, x_random, x)
@@ -111,30 +111,58 @@ class LazyMLP(nn.Module):
         )
 
     def forward(self, x: torch.tensor):
-        """Run inputs through linear block."""
+        return self.model(x)
+
+
+class LazyMLP2(nn.Module):
+    def __init__(self, hidden_layers: list = [64, 128, 64, 32], activation_fn: nn.Module = nn.ReLU,
+                 batch_norm: bool = False):
+        super().__init__()
+        self.hidden_layers = hidden_layers
+        if batch_norm:
+            lazy_block = nn.Sequential(
+                nn.LazyLinear(hidden_layers[0]),
+                nn.BatchNorm1d(hidden_layers[0]),
+                activation_fn(),
+            )
+        else:
+            lazy_block = nn.Sequential(nn.LazyLinear(hidden_layers[0]), activation_fn())
+
+        layers = []
+        in_dim = hidden_layers[0]
+        for hdim in hidden_layers[1:]:
+            layers.append(LinearLayer(in_dim, hdim, batch_norm))
+            in_dim = hdim
+
+        self.model = nn.Sequential(
+            lazy_block,
+            *layers,
+        )
+
+    def forward(self, x: torch.tensor):
         return self.model(x)
 
 
 class S2SDEncoder(pl.LightningModule):
     def __init__(
             self,
-            hidden_dim: int,
-            n_encoder_layers: int,
-            n_projection_layers: int,
+            encoder: nn.Module,
+            projector: nn.Module,
             loss_fn: nn.Module = losses.SelfSupervisedLoss(losses.NTXentLoss(temperature=1.0)),
             corrupt_fn=None,
             lr: float = 1e-3,
-            batch_norm: bool = False,
     ) -> None:
         super().__init__()
 
-        self.save_hyperparameters(ignore=['corrupt_fn', 'loss_fn'])
+        self.save_hyperparameters(ignore=['corrupt_fn', 'loss_fn', 'encoder', 'projector'])
 
+        self.encoder = encoder
+        self.projector = projector
         self.loss_fn = loss_fn
         self.corrupt_fn = corrupt_fn
 
-        self.encoder = LazyMLP(n_layers=n_encoder_layers, dim_hidden=hidden_dim, batch_norm=batch_norm)
-        self.projector = LazyMLP(n_layers=n_projection_layers, dim_hidden=hidden_dim, batch_norm=batch_norm)
+    def forward(self, x: Tensor) -> Tensor:
+        return self.encoder(x)
 
     def _step(self, x: Tensor):
         x1, x2 = self.corrupt_fn(x)
@@ -194,13 +222,13 @@ class S2SDClassifier(pl.LightningModule):
         return optimizer
 
     def forward(self, x: Tensor) -> Tensor:
-        h = self.encoder(x)
+        h = self.encoder.encoder(x)
         return self.classifier(h)
 
     def _step(self, x: Tensor, y: Tensor):
         predictions = self(x)
 
-        loss = self.score_func(predictions, y)
+        loss = self.loss_fn(predictions, y)
         score = self.score_func(predictions, y)
 
         return loss, score
@@ -220,7 +248,7 @@ class S2SDClassifier(pl.LightningModule):
         )
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx):
         x, y = batch
 
         loss, score = self._step(x, y)
@@ -234,6 +262,7 @@ class S2SDClassifier(pl.LightningModule):
             logger=True,
         )
         return loss
+
 
 # ***************
 class FWC2AEv3(pl.LightningModule):

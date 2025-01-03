@@ -31,6 +31,8 @@ def load_data(dataset_name: str, base_dir: str = DEFAULT_BASE_DIR, raw: bool = T
     for csv_file in csv_files:
         df = pd.read_csv(csv_file, encoding='utf-8', on_bad_lines='skip')
         print(f'loaded {df.shape} from {csv_file}')
+        print('label distribution')
+        print(df['Stage'].value_counts())
         dfs.append(df)
 
     df = pd.concat(dfs, ignore_index=True)
@@ -88,9 +90,10 @@ def clearn_data(df: pd.DataFrame, impute_nan=False) -> tuple:
     return df
 
 
-def load_train_test_sets(dataset_name='scvic21', anomaly=True, seed=42):
-    train_set = pd.read_csv(f'./data/{dataset_name}/{'anomaly' if anomaly else 'supervised'}/train.csv')
-    test_set = pd.read_csv(f'./data/{dataset_name}/{'anomaly' if anomaly else 'supervised'}/test.csv')
+def load_train_test_sets(dataset_name='dapt20', anomaly=True, seed=42):
+    task = 'anomaly' if anomaly else 'supervised'
+    train_set = pd.read_csv(f'./data/{dataset_name}/{task}/train.csv')
+    test_set = pd.read_csv(f'./data/{dataset_name}/{task}/test.csv')
 
     val_set = train_set.sample(frac=0.1, random_state=seed)
     train_set = train_set.drop(val_set.index)
@@ -144,7 +147,7 @@ def tsne_scatter_anomaly(features, labels, dimensions=2, save_as='graph.png', no
     ax.scatter(
         *zip(*features_embedded[np.where(labels == 0)]),
         marker='o',
-        color=colors[0],
+        color=colors[1],
         s=2,
         alpha=0.3,
         label='Benign'
