@@ -31,8 +31,6 @@ def load_data(dataset_name: str, base_dir: str = DEFAULT_BASE_DIR, raw: bool = T
     for csv_file in csv_files:
         df = pd.read_csv(csv_file, encoding='utf-8', on_bad_lines='skip')
         print(f'loaded {df.shape} from {csv_file}')
-        print('label distribution')
-        print(df['Stage'].value_counts())
         dfs.append(df)
 
     df = pd.concat(dfs, ignore_index=True)

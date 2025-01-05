@@ -146,18 +146,26 @@ class LazyMLP2(nn.Module):
 class S2SDEncoder(pl.LightningModule):
     def __init__(
             self,
-            encoder: nn.Module,
-            projector: nn.Module,
+            hidden_dim: int = 32,
+            n_enc_layers: int = 4,
+            n_prj_layers: int = 2,
             loss_fn: nn.Module = losses.SelfSupervisedLoss(losses.NTXentLoss(temperature=1.0)),
             corrupt_fn=None,
             lr: float = 1e-3,
     ) -> None:
         super().__init__()
 
-        self.save_hyperparameters(ignore=['corrupt_fn', 'loss_fn', 'encoder', 'projector'])
+        self.save_hyperparameters(ignore=['corrupt_fn', 'loss_fn'])
 
-        self.encoder = encoder
-        self.projector = projector
+        self.encoder = LazyMLP2([64, 128, 64, hidden_dim], batch_norm=True)
+        self.projector = LazyMLP2([hidden_dim] * n_prj_layers, batch_norm=True)
+
+        print('encoder arch:')
+        print(self.encoder)
+
+        print('projector arch:')
+        print(self.projector)
+
         self.loss_fn = loss_fn
         self.corrupt_fn = corrupt_fn
 
@@ -171,7 +179,7 @@ class S2SDEncoder(pl.LightningModule):
         return self.loss_fn(h1, h2)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=1e-5)
         return optimizer
 
     def training_step(self, batch, batch_idx):
@@ -193,6 +201,56 @@ class S2SDEncoder(pl.LightningModule):
     def get_embeddings(self, x: Tensor) -> Tensor:
         return self.encoder(x)
 
+# class S2SDEncoder(pl.LightningModule):
+#     def __init__(
+#             self,
+#             encoder: nn.Module,
+#             projector: nn.Module,
+#             loss_fn: nn.Module = losses.SelfSupervisedLoss(losses.NTXentLoss(temperature=1.0)),
+#             corrupt_fn=None,
+#             lr: float = 1e-3,
+#     ) -> None:
+#         super().__init__()
+#
+#         self.save_hyperparameters(ignore=['corrupt_fn', 'loss_fn', 'encoder', 'projector'])
+#
+#         self.encoder = encoder
+#         self.projector = projector
+#         self.loss_fn = loss_fn
+#         self.corrupt_fn = corrupt_fn
+#
+#     def forward(self, x: Tensor) -> Tensor:
+#         return self.encoder(x)
+#
+#     def _step(self, x: Tensor):
+#         x1, x2 = self.corrupt_fn(x)
+#         h1, h2 = self.projector(self.encoder(x1)), self.projector(self.encoder(x2))
+#
+#         return self.loss_fn(h1, h2)
+#
+#     def configure_optimizers(self):
+#         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+#         return optimizer
+#
+#     def training_step(self, batch, batch_idx):
+#         x, _ = batch
+#
+#         loss = self._step(x)
+#
+#         self.log('train_loss', loss, prog_bar=True)
+#         return loss
+#
+#     def validation_step(self, batch, batch_idx):
+#         x, _ = batch
+#
+#         loss = self._step(x)
+#
+#         self.log('val_loss', loss, prog_bar=True)
+#
+#     @torch.inference_mode()
+#     def get_embeddings(self, x: Tensor) -> Tensor:
+#         return self.encoder(x)
+#
 
 class S2SDClassifier(pl.LightningModule):
     def __init__(

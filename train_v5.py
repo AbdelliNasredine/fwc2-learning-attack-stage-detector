@@ -110,11 +110,9 @@ def main_fn(
         features_high=train_ds.features_high,
     )
     loss_fn = losses.SelfSupervisedLoss(losses.NTXentLoss(temperature=tau))
-    encoder = LazyMLP2([64, 128, 64, encoder_hidden_dim], batch_norm=True)
-    projector = LazyMLP2([encoder_hidden_dim] * n_projection_layers, batch_norm=True)
     model = S2SDEncoder(
-        encoder=encoder,
-        projector=projector,
+        hidden_dim=encoder_hidden_dim,
+        n_prj_layers=n_projection_layers,
         corrupt_fn=corrupt_fn,
         loss_fn=loss_fn,
         lr=learning_rate
