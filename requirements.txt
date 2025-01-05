@@ -2,6 +2,7 @@ python-dotenv
 torch
 numpy
 pandas
+pyod
 scikit-learn
 matplotlib
 seaborn
